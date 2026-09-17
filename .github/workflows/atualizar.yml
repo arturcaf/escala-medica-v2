@@ -1,4 +1,4 @@
-name: Restaurar Versao Original Completa
+name: Injetar Melhorias na Escala Original
 
 on:
   workflow_dispatch:
@@ -8,17 +8,94 @@ permissions:
   contents: write
 
 jobs:
-  restore:
+  build:
     runs-on: ubuntu-latest
     steps:
       - name: Baixar repositorio
         uses: actions/checkout@v4
 
-      - name: Restaurar JAR original com todos os dados
+      - name: Baixar JAR original do v1 e extrair index.html
         run: |
+          sudo apt-get update && sudo apt-get install -y zip unzip
           curl -L -o escala-medica.jar https://github.com/arturcaf/escala-medica/raw/master/escala-medica.jar
+          mkdir -p /tmp/extract
+          cd /tmp/extract
+          unzip -o $GITHUB_WORKSPACE/escala-medica.jar static/index.html || true
+
+      - name: Injetar modulo de PDF sobre a tela original
+        run: |
+          python3 - << 'EOF'
+          import os
+
+          path = '/tmp/extract/static/index.html'
+          if not os.path.exists(path):
+              print("Erro: index.html nao encontrado")
+              exit(1)
+
+          with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+              content = f.read()
+
+          script_pdf = """
+          <!-- MODULO DE EMISSAO DE PDF DA ESCALA -->
+          <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+          <script>
+            window.exportarEscalaPDF = function() {
+              const tabela = document.querySelector('table') || document.body;
+              const clone = tabela.cloneNode(true);
+              
+              const container = document.createElement('div');
+              container.style.padding = '20px';
+              container.style.fontFamily = 'Arial, sans-serif';
+              container.innerHTML = `
+                <div style="border-bottom: 2px solid #0056b3; padding-bottom: 10px; margin-bottom: 15px;">
+                  <h2 style="margin:0; color:#0056b3;">Hospital Santa Helena</h2>
+                  <h4 style="margin:4px 0;">Escala Oficial de Plantões - Ortopedia e Traumatologia</h4>
+                  <small>Documento emitido em: ${new Date().toLocaleDateString('pt-BR')} às ${new Date().toLocaleTimeString('pt-BR')}</small>
+                </div>
+              `;
+              container.appendChild(clone);
+
+              const opt = {
+                margin: 10,
+                filename: `escala_ortopedia_${new Date().toISOString().slice(0,10)}.pdf`,
+                image: { type: 'jpeg', quality: 0.98 },
+                html2canvas: { scale: 2 },
+                jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' }
+              };
+              html2pdf().set(opt).from(container).save();
+            };
+
+            window.addEventListener('DOMContentLoaded', function() {
+              const barra = document.createElement('div');
+              barra.style.cssText = 'position: fixed; bottom: 20px; right: 20px; z-index: 99999; box-shadow: 0 4px 12px rgba(0,0,0,0.25); border-radius: 30px;';
+              barra.innerHTML = `
+                <button onclick="exportarEscalaPDF()" style="cursor: pointer; background: #0056b3; color: #fff; border: none; padding: 12px 20px; border-radius: 30px; font-weight: bold; font-size: 14px; display: flex; align-items: center; gap: 8px;">
+                  📄 Baixar Escala em PDF
+                </button>
+              `;
+              document.body.appendChild(barra);
+            });
+          </script>
+          """
+
+          if '</body>' in content:
+              novo_content = content.replace('</body>', script_pdf + '\n</body>')
+          else:
+              novo_content = content + script_pdf
+
+          with open(path, 'w', encoding='utf-8') as f:
+              f.write(novo_content)
+
+          print("Melhoria de PDF injetada com sucesso!")
+          EOF
+
+      - name: Atualizar JAR e Salvar no GitHub
+        run: |
+          cd /tmp/extract
+          zip -u $GITHUB_WORKSPACE/escala-medica.jar static/index.html
+          cd $GITHUB_WORKSPACE
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add escala-medica.jar
-          git commit -m "Restaura escala-medica.jar original com todos os dados [skip ci]" || echo "Sem alteracoes"
+          git commit -m "Aplica emissao de PDF preservando todos os medicos e plantoes [skip ci]" || echo "Sem alteracoes"
           git push
