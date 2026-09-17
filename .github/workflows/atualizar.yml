@@ -1,0 +1,32 @@
+name: Atualizar Escala Médica JAR
+
+on:
+  push:
+    paths:
+      - 'resources/static/**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-jar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baixar repositório
+        uses: actions/checkout@v4
+
+      - name: Injetar novo index.html no JAR
+        run: |
+          sudo apt-get update && sudo apt-get install -y zip
+          mkdir -p static
+          cp resources/static/index.html static/index.html
+          zip -u escala-medica.jar static/index.html
+
+      - name: Gravar JAR atualizado no GitHub
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add escala-medica.jar
+          git commit -m "Atualiza escala-medica.jar com GPS, SSE e PDF [skip ci]" || echo "Sem alterações"
+          git push
