@@ -1,32 +1,24 @@
-name: Atualizar Escala Médica JAR
+name: Restaurar Versao Original Completa
 
 on:
-  push:
-    paths:
-      - 'resources/static/**'
   workflow_dispatch:
+  push:
 
 permissions:
   contents: write
 
 jobs:
-  update-jar:
+  restore:
     runs-on: ubuntu-latest
     steps:
-      - name: Baixar repositório
+      - name: Baixar repositorio
         uses: actions/checkout@v4
 
-      - name: Injetar novo index.html no JAR
+      - name: Restaurar JAR original com todos os dados
         run: |
-          sudo apt-get update && sudo apt-get install -y zip
-          mkdir -p static
-          cp resources/static/index.html static/index.html
-          zip -u escala-medica.jar static/index.html
-
-      - name: Gravar JAR atualizado no GitHub
-        run: |
+          curl -L -o escala-medica.jar https://github.com/arturcaf/escala-medica/raw/master/escala-medica.jar
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add escala-medica.jar
-          git commit -m "Atualiza escala-medica.jar com GPS, SSE e PDF [skip ci]" || echo "Sem alterações"
+          git commit -m "Restaura escala-medica.jar original com todos os dados [skip ci]" || echo "Sem alteracoes"
           git push
