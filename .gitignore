@@ -1,5 +1,5 @@
-# Ignorar apenas arquivos de dados locais
+# Ignorar arquivos de dados locais e saida do build
 data/*.db
 *.class
 out/
-# NAO ignorar o JAR
+target/
