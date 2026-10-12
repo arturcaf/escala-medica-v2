@@ -102,6 +102,7 @@ public class EscalaServer {
       var3.createContext("/api/checkin", autenticado(EscalaServer::handleCheckin));
       var3.createContext("/api/notificacoes", autenticado(EscalaServer::handleNotificacoes));
       var3.createContext("/api/whatsapp", autenticado(EscalaServer::handleWhatsApp));
+      var3.createContext("/api/cadastro-forms", EscalaServer::handleCadastroForms);
       var3.createContext("/api/stats", EscalaServer::handleStats);
       var3.createContext("/api/events", autenticado(EscalaServer::handleSSE));
       var3.createContext("/", EscalaServer::handleStatic);
@@ -686,6 +687,140 @@ public class EscalaServer {
       }
    }
 
+   // Cria o medico no banco e na lista em memoria. Devolve null se ja existir um com o mesmo nome.
+   static synchronized Map<String, String> criarMedico(String nome, String telefone, String funcao, String crm, String email) throws Exception {
+      String n = nome.trim();
+      if (medicos.stream().anyMatch(m -> m.get("nome").equalsIgnoreCase(n))) {
+         return null;
+      }
+
+      int id = medicoIdCounter.getAndIncrement();
+      try (PreparedStatement ps = db.prepareStatement(
+         "INSERT INTO medicos_db (id,nome,telefone,funcao,crm,email,ativo,created_at,updated_at) VALUES (?,?,?,?,?,?,1,?,?)"
+      )) {
+         ps.setInt(1, id);
+         ps.setString(2, n);
+         ps.setString(3, telefone);
+         ps.setString(4, funcao);
+         ps.setString(5, crm);
+         ps.setString(6, email);
+         ps.setString(7, now());
+         ps.setString(8, now());
+         ps.executeUpdate();
+      }
+      LinkedHashMap<String, String> m = new LinkedHashMap<>();
+      m.put("id", String.valueOf(id));
+      m.put("nome", n);
+      m.put("telefone", telefone);
+      m.put("funcao", funcao);
+      m.put("crm", crm);
+      m.put("email", email);
+      m.put("ativo", "1");
+      medicos.add(m);
+      medicos.sort((a, b) -> a.get("nome").compareTo(b.get("nome")));
+      saveMedicosToJson();
+      addNotificacaoAndBroadcast("MEDICO_CRIADO", "Novo medico cadastrado", "Dr(a). " + n + " (" + funcao + ") foi adicionado(a) a equipe.");
+      broadcast("medicos_update", "{\"acao\":\"criado\",\"id\":" + id + ",\"nome\":\"" + escapeJson(n) + "\"}");
+      return m;
+   }
+
+   // POST /api/cadastro-forms  {nome, email, crm, telefone}
+   // Usado pelo Apps Script do formulario de cadastro. Autentica com a chave da variavel
+   // de ambiente FORMS_TOKEN (header "Authorization: Bearer <chave>"), nao com a senha do admin,
+   // e so consegue cadastrar medico novo. Quem ja existe (mesmo telefone, CRM ou nome) e devolvido
+   // como "existente" sem alterar nada.
+   static void handleCadastroForms(HttpExchange var0) throws IOException {
+      if (!"POST".equals(var0.getRequestMethod())) {
+         send405(var0);
+         return;
+      }
+      String chave = System.getenv("FORMS_TOKEN");
+      if (chave == null || chave.length() < 20) {
+         sendJson(var0, 503, "{\"error\":\"Cadastro pelo formulario desativado: defina FORMS_TOKEN no servidor\"}");
+         return;
+      }
+      String token = getToken(var0);
+      if (token == null || !java.security.MessageDigest.isEqual(chave.getBytes(StandardCharsets.UTF_8), token.getBytes(StandardCharsets.UTF_8))) {
+         sendJson(var0, 401, "{\"error\":\"Chave do formulario invalida\"}");
+         return;
+      }
+
+      Map<String, String> body = parseJsonObject(new String(var0.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+      String nome = body.getOrDefault("nome", "").trim().replaceAll("\\s+", " ");
+      String crm = body.getOrDefault("crm", "").trim();
+      String email = body.getOrDefault("email", "").trim();
+      String telefone = formatarTelefone(body.getOrDefault("telefone", ""));
+      if (nome.isEmpty()) {
+         sendJson(var0, 400, "{\"error\":\"Nome obrigatorio\"}");
+         return;
+      }
+
+      try {
+         Map<String, String> m;
+         synchronized (EscalaServer.class) {
+            m = medicoExistente(nome, crm, telefone);
+            if (m == null) {
+               m = criarMedico(nome, telefone, "Plantonista", crm, email);
+               if (m != null) {
+                  sendJson(var0, 200, "{\"ok\":true,\"status\":\"criado\",\"id\":" + m.get("id") + ",\"nome\":\"" + escapeJson(m.get("nome")) + "\"}");
+                  return;
+               }
+               m = medicoExistente(nome, "", "");
+            }
+         }
+         sendJson(var0, 200, "{\"ok\":true,\"status\":\"existente\",\"id\":" + m.get("id") + ",\"nome\":\"" + escapeJson(m.get("nome")) + "\"}");
+      } catch (Exception e) {
+         sendJson(var0, 500, "{\"error\":\"" + escapeJson(e.getMessage()) + "\"}");
+      }
+   }
+
+   // Mesmos 8 ultimos digitos do telefone, mesmo CRM (so numeros) ou mesmo nome sem acentos.
+   static Map<String, String> medicoExistente(String nome, String crm, String telefone) {
+      String fimTel = soDigitos(telefone);
+      fimTel = fimTel.length() >= 8 ? fimTel.substring(fimTel.length() - 8) : "";
+      String crmDig = soDigitos(crm);
+      String nomeNorm = normalizarNome(nome);
+      for (Map<String, String> m : medicos) {
+         String t = soDigitos(m.get("telefone"));
+         if (!fimTel.isEmpty() && t.endsWith(fimTel)) {
+            return m;
+         }
+         if (!crmDig.isEmpty() && crmDig.equals(soDigitos(m.get("crm")))) {
+            return m;
+         }
+         if (normalizarNome(m.get("nome")).equals(nomeNorm)) {
+            return m;
+         }
+      }
+      return null;
+   }
+
+   // "71 99999-8888" -> "+55 71 99999-8888" (mesmo formato dos medicos ja cadastrados)
+   static String formatarTelefone(String tel) {
+      String d = soDigitos(tel);
+      if (d.length() == 10 || d.length() == 11) {
+         d = "55" + d;
+      }
+      if (d.length() == 13) {
+         return "+" + d.substring(0, 2) + " " + d.substring(2, 4) + " " + d.substring(4, 9) + "-" + d.substring(9);
+      }
+      if (d.length() == 12) {
+         return "+" + d.substring(0, 2) + " " + d.substring(2, 4) + " " + d.substring(4, 8) + "-" + d.substring(8);
+      }
+      return tel == null ? "" : tel.trim();
+   }
+
+   static String soDigitos(String s) {
+      return s == null ? "" : s.replaceAll("[^0-9]", "");
+   }
+
+   static String normalizarNome(String s) {
+      if (s == null) {
+         return "";
+      }
+      return java.text.Normalizer.normalize(s, java.text.Normalizer.Form.NFD).replaceAll("\\p{M}", "").replace("*", "").trim().replaceAll("\\s+", " ").toLowerCase();
+   }
+
    static void handleMedicos(HttpExchange var0) throws IOException {
       String var1 = var0.getRequestMethod();
       String var2 = var0.getRequestURI().getPath();
@@ -726,44 +861,15 @@ public class EscalaServer {
                return;
             }
 
-            boolean var21 = medicos.stream().anyMatch(var1x -> var1x.get("nome").equalsIgnoreCase(var18.trim()));
-            if (var21) {
+            Map<String, String> var12 = criarMedico(
+               var18, var15.getOrDefault("telefone", ""), var15.getOrDefault("funcao", "Plantonista"), var15.getOrDefault("crm", ""), var15.getOrDefault("email", "")
+            );
+            if (var12 == null) {
                sendJson(var0, 400, "{\"error\":\"Medico com este nome ja existe\"}");
                return;
             }
 
-            int var24 = medicoIdCounter.getAndIncrement();
-            String var27 = var15.getOrDefault("telefone", "");
-            String var29 = var15.getOrDefault("funcao", "Plantonista");
-            String var31 = var15.getOrDefault("crm", "");
-            String var33 = var15.getOrDefault("email", "");
-            PreparedStatement var35 = db.prepareStatement(
-               "INSERT INTO medicos_db (id,nome,telefone,funcao,crm,email,ativo,created_at,updated_at) VALUES (?,?,?,?,?,?,1,?,?)"
-            );
-            var35.setInt(1, var24);
-            var35.setString(2, var18.trim());
-            var35.setString(3, var27);
-            var35.setString(4, var29);
-            var35.setString(5, var31);
-            var35.setString(6, var33);
-            var35.setString(7, now());
-            var35.setString(8, now());
-            var35.executeUpdate();
-            var35.close();
-            LinkedHashMap var12 = new LinkedHashMap();
-            var12.put("id", String.valueOf(var24));
-            var12.put("nome", var18.trim());
-            var12.put("telefone", var27);
-            var12.put("funcao", var29);
-            var12.put("crm", var31);
-            var12.put("email", var33);
-            var12.put("ativo", "1");
-            medicos.add(var12);
-            medicos.sort((var0x, var1x) -> var0x.get("nome").compareTo(var1x.get("nome")));
-            saveMedicosToJson();
-            addNotificacaoAndBroadcast("MEDICO_CRIADO", "Novo medico cadastrado", "Dr(a). " + var18.trim() + " (" + var29 + ") foi adicionado(a) a equipe.");
-            broadcast("medicos_update", "{\"acao\":\"criado\",\"id\":" + var24 + ",\"nome\":\"" + escapeJson(var18.trim()) + "\"}");
-            sendJson(var0, 200, "{\"ok\":true,\"id\":" + var24 + ",\"nome\":\"" + escapeJson(var18.trim()) + "\",\"funcao\":\"" + escapeJson(var29) + "\"}");
+            sendJson(var0, 200, "{\"ok\":true,\"id\":" + var12.get("id") + ",\"nome\":\"" + escapeJson(var12.get("nome")) + "\",\"funcao\":\"" + escapeJson(var12.get("funcao")) + "\"}");
          } else if ("PUT".equals(var1)) {
             if (!isAdmin(var0)) {
                sendJson(var0, 403, "{\"error\":\"Apenas o administrador pode editar medicos\"}");
