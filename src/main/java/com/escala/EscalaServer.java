@@ -9,6 +9,12 @@ import java.net.InetSocketAddress;
 import java.net.URL;
 import java.net.URLDecoder;
 import java.net.URLEncoder;
+import java.security.SecureRandom;
+import java.security.spec.KeySpec;
+import java.util.Base64;
+import javax.crypto.SecretKeyFactory;
+import javax.crypto.spec.PBEKeySpec;
+import com.sun.net.httpserver.HttpHandler;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -43,7 +49,11 @@ public class EscalaServer {
    static final double HOSP_LON = -38.3324179;
    static final double CHECKIN_RADIUS_KM = 2.0;
    static final String ADMIN_CRM = "27140";
-   static final String ADMIN_SENHA = "71991402300";
+   // Senha do admin antes de ele criar a propria. Pode ser trocada pela variavel ADMIN_SENHA.
+   static final String ADMIN_SENHA_INICIAL = "71991402300";
+   static final int SENHA_MIN = 6;
+   static final int MAX_FALHAS = 5;
+   static final long BLOQUEIO_MS = 10 * 60 * 1000L;
    static final String ADMIN_NOME = "Artur Cesar";
    static final String CALLMEBOT_URL = "https://api.callmebot.com/whatsapp.php";
    static List<String[]> escala = new ArrayList<>();
@@ -52,6 +62,8 @@ public class EscalaServer {
    static Path dataDir;
    static String frontendHtml = "";
    static Map<String, Map<String, String>> sessions = new ConcurrentHashMap<>();
+   static Map<String, long[]> loginFalhas = new ConcurrentHashMap<>();
+   static final SecureRandom RANDOM = new SecureRandom();
    static AtomicInteger trocaCounter = new AtomicInteger(1);
    static AtomicInteger medicoIdCounter = new AtomicInteger(19);
    static final List<HttpExchange> sseClients = Collections.synchronizedList(new ArrayList<>());
@@ -83,19 +95,20 @@ public class EscalaServer {
       var3.createContext("/api/login", EscalaServer::handleLogin);
       var3.createContext("/api/logout", EscalaServer::handleLogout);
       var3.createContext("/api/me", EscalaServer::handleMe);
-      var3.createContext("/api/escala", EscalaServer::handleEscala);
-      var3.createContext("/api/medicos", EscalaServer::handleMedicos);
-      var3.createContext("/api/trocas", EscalaServer::handleTrocas);
-      var3.createContext("/api/checkin", EscalaServer::handleCheckin);
-      var3.createContext("/api/notificacoes", EscalaServer::handleNotificacoes);
-      var3.createContext("/api/whatsapp", EscalaServer::handleWhatsApp);
+      var3.createContext("/api/senha", EscalaServer::handleSenha);
+      var3.createContext("/api/escala", autenticado(EscalaServer::handleEscala));
+      var3.createContext("/api/medicos", autenticado(EscalaServer::handleMedicos));
+      var3.createContext("/api/trocas", autenticado(EscalaServer::handleTrocas));
+      var3.createContext("/api/checkin", autenticado(EscalaServer::handleCheckin));
+      var3.createContext("/api/notificacoes", autenticado(EscalaServer::handleNotificacoes));
+      var3.createContext("/api/whatsapp", autenticado(EscalaServer::handleWhatsApp));
       var3.createContext("/api/stats", EscalaServer::handleStats);
-      var3.createContext("/api/events", EscalaServer::handleSSE);
+      var3.createContext("/api/events", autenticado(EscalaServer::handleSSE));
       var3.createContext("/", EscalaServer::handleStatic);
       var3.setExecutor(Executors.newFixedThreadPool(16));
       var3.start();
       System.out.println("\n  Servidor: http://localhost:" + PORT);
-      System.out.println("  Admin: CRM 27140 | Senha: 71991402300\n");
+      System.out.println("  Admin: CRM 27140\n");
       scheduleReminders();
    }
 
@@ -115,6 +128,7 @@ public class EscalaServer {
          "CREATE TABLE IF NOT EXISTS notificacoes (id INTEGER PRIMARY KEY AUTOINCREMENT, tipo TEXT, titulo TEXT, mensagem TEXT, data TEXT, lida INTEGER DEFAULT 0)"
       );
       var1.execute("CREATE TABLE IF NOT EXISTS escala_overrides (plantao_id TEXT PRIMARY KEY, plantonista TEXT, status TEXT, turno TEXT, updated_at TEXT)");
+      var1.execute("CREATE TABLE IF NOT EXISTS senhas (usuario TEXT PRIMARY KEY, hash TEXT NOT NULL, updated_at TEXT)");
       var1.execute("CREATE TABLE IF NOT EXISTS whatsapp_keys (medico TEXT PRIMARY KEY, telefone TEXT, apikey TEXT, ativo INTEGER DEFAULT 1, created_at TEXT)");
       var1.execute(
          "CREATE TABLE IF NOT EXISTS medicos_db (id INTEGER PRIMARY KEY, nome TEXT NOT NULL, telefone TEXT, funcao TEXT DEFAULT 'Plantonista', crm TEXT DEFAULT '', email TEXT DEFAULT '', ativo INTEGER DEFAULT 1, created_at TEXT, updated_at TEXT)"
@@ -414,7 +428,8 @@ public class EscalaServer {
             }
          }
 
-         return null;
+         String var7 = parseQuery(var0.getRequestURI().getQuery()).get("token");
+         return var7 != null && !var7.isEmpty() ? var7 : null;
       }
    }
 
@@ -439,62 +454,197 @@ public class EscalaServer {
    static void handleLogin(HttpExchange var0) throws IOException {
       if (!"POST".equals(var0.getRequestMethod())) {
          send405(var0);
-      } else {
-         Map<String, String> var1 = parseJsonObject(new String(var0.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
-         String var2 = var1.getOrDefault("crm", "").trim();
-         String var3 = var1.getOrDefault("senha", "").trim();
-         if ("27140".equals(var2) && "71991402300".equals(var3)) {
-            String var13 = UUID.randomUUID().toString();
-            LinkedHashMap var14 = new LinkedHashMap();
-            var14.put("nome", "Artur Cesar");
-            var14.put("crm", var2);
-            var14.put("isAdmin", "true");
-            var14.put("token", var13);
-            sessions.put(var13, var14);
-            long var15 = countNotifPendentes();
-            sendJson(
-               var0,
-               200,
-               "{\"token\":\"" + var13 + "\",\"nome\":\"Artur Cesar\",\"crm\":\"" + var2 + "\",\"isAdmin\":true,\"notificacoesPendentes\":" + var15 + "}"
-            );
-         } else {
-            Map var4 = medicos.stream().filter(var1x -> var2.equals(var1x.get("id")) || var2.equals(var1x.get("crm"))).findFirst().orElse(null);
-            if (var4 != null) {
-               String var5 = ((String)var4.get("telefone")).replaceAll("[^0-9]", "");
-               String var6 = var3.replaceAll("[^0-9]", "");
-               if (var5.endsWith(var6) || var6.equals(var5)) {
-                  String var7 = UUID.randomUUID().toString();
-                  LinkedHashMap var8 = new LinkedHashMap();
-                  var8.put("nome", (String)var4.get("nome"));
-                  var8.put("crm", (String)var4.get("id"));
-                  var8.put("isAdmin", "false");
-                  var8.put("token", var7);
-                  sessions.put(var7, var8);
-                  long var9 = countNotifPendentes();
-                  String var11 = getApiKey((String)var4.get("nome"));
-                  boolean var12 = var11 != null && !var11.isEmpty();
-                  sendJson(
-                     var0,
-                     200,
-                     "{\"token\":\""
-                        + var7
-                        + "\",\"nome\":\""
-                        + escapeJson((String)var4.get("nome"))
-                        + "\",\"crm\":\""
-                        + (String)var4.get("id")
-                        + "\",\"isAdmin\":false,\"notificacoesPendentes\":"
-                        + var9
-                        + ",\"whatsappAtivo\":"
-                        + var12
-                        + "}"
-                  );
-                  return;
-               }
-            }
-
-            sendJson(var0, 401, "{\"error\":\"CRM/ID ou senha invalidos\"}");
-         }
+         return;
       }
+      Map<String, String> var1 = parseJsonObject(new String(var0.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+      String crm = var1.getOrDefault("crm", "").trim();
+      String senha = var1.getOrDefault("senha", "").trim();
+      if (crm.isEmpty() || senha.isEmpty()) {
+         sendJson(var0, 400, "{\"error\":\"Preencha CRM/ID e senha\"}");
+         return;
+      }
+      long[] falhas = loginFalhas.get(crm);
+      if (falhas != null && falhas[0] >= MAX_FALHAS && System.currentTimeMillis() - falhas[1] < BLOQUEIO_MS) {
+         sendJson(var0, 429, "{\"error\":\"Muitas tentativas erradas. Aguarde 10 minutos e tente de novo.\"}");
+         return;
+      }
+
+      boolean admin = ADMIN_CRM.equals(crm);
+      Map<String, String> medico = admin ? null : medicos.stream().filter(m -> crm.equals(m.get("id")) || crm.equals(m.get("crm"))).findFirst().orElse(null);
+      String usuario = admin ? "admin" : (medico != null ? medico.get("id") : null);
+      Boolean trocar = usuario == null ? null : conferirSenha(usuario, medico, senha);
+      if (trocar == null) {
+         long[] f = loginFalhas.computeIfAbsent(crm, k -> new long[2]);
+         if (System.currentTimeMillis() - f[1] >= BLOQUEIO_MS) {
+            f[0] = 0;
+         }
+         f[0]++;
+         f[1] = System.currentTimeMillis();
+         sendJson(var0, 401, "{\"error\":\"CRM/ID ou senha invalidos\"}");
+         return;
+      }
+      loginFalhas.remove(crm);
+
+      String token = UUID.randomUUID().toString();
+      LinkedHashMap<String, String> sessao = new LinkedHashMap<>();
+      sessao.put("nome", admin ? ADMIN_NOME : medico.get("nome"));
+      sessao.put("crm", admin ? crm : medico.get("id"));
+      sessao.put("isAdmin", admin ? "true" : "false");
+      sessao.put("usuario", usuario);
+      sessao.put("trocarSenha", trocar ? "true" : "false");
+      sessao.put("token", token);
+      sessions.put(token, sessao);
+      long pendentes = countNotifPendentes();
+      StringBuilder json = new StringBuilder("{\"token\":\"").append(token)
+         .append("\",\"nome\":\"").append(escapeJson(sessao.get("nome")))
+         .append("\",\"crm\":\"").append(escapeJson(sessao.get("crm")))
+         .append("\",\"isAdmin\":").append(admin)
+         .append(",\"notificacoesPendentes\":").append(pendentes)
+         .append(",\"trocarSenha\":").append(trocar);
+      if (!admin) {
+         String apiKey = getApiKey(medico.get("nome"));
+         json.append(",\"whatsappAtivo\":").append(apiKey != null && !apiKey.isEmpty());
+      }
+      sendJson(var0, 200, json.append("}").toString());
+   }
+
+   // Confere a senha. Devolve null se estiver errada, true se o usuario ainda
+   // precisa criar a propria senha (primeiro acesso) e false se ja criou.
+   static Boolean conferirSenha(String usuario, Map<String, String> medico, String senha) {
+      String hash = getSenhaHash(usuario);
+      if (hash != null) {
+         return verificarHash(senha, hash) ? false : null;
+      }
+      if ("admin".equals(usuario)) {
+         String env = System.getenv("ADMIN_SENHA");
+         if (env != null && !env.isEmpty()) {
+            return env.equals(senha) ? false : null;
+         }
+         return ADMIN_SENHA_INICIAL.equals(senha) ? true : null;
+      }
+      // Primeiro acesso: telefone completo, so numeros (com ou sem o 55 do pais)
+      String tel = medico.get("telefone") == null ? "" : medico.get("telefone").replaceAll("[^0-9]", "");
+      String dig = senha.replaceAll("[^0-9]", "");
+      if (tel.length() < 10 || dig.length() < 10) {
+         return null;
+      }
+      return dig.equals(tel) || ("55" + dig).equals(tel) ? true : null;
+   }
+
+   static String getSenhaHash(String usuario) {
+      try (PreparedStatement ps = db.prepareStatement("SELECT hash FROM senhas WHERE usuario=?")) {
+         ps.setString(1, usuario);
+         ResultSet rs = ps.executeQuery();
+         return rs.next() ? rs.getString(1) : null;
+      } catch (Exception e) {
+         System.err.println("Erro ao ler senha: " + e.getMessage());
+         return null;
+      }
+   }
+
+   static String gerarHash(String senha) throws Exception {
+      byte[] salt = new byte[16];
+      RANDOM.nextBytes(salt);
+      int iter = 120000;
+      return "pbkdf2$" + iter + "$" + Base64.getEncoder().encodeToString(salt) + "$" + Base64.getEncoder().encodeToString(pbkdf2(senha, salt, iter));
+   }
+
+   static boolean verificarHash(String senha, String guardado) {
+      try {
+         String[] p = guardado.split("\\$");
+         byte[] salt = Base64.getDecoder().decode(p[2]);
+         byte[] esperado = Base64.getDecoder().decode(p[3]);
+         return java.security.MessageDigest.isEqual(esperado, pbkdf2(senha, salt, Integer.parseInt(p[1])));
+      } catch (Exception e) {
+         return false;
+      }
+   }
+
+   static byte[] pbkdf2(String senha, byte[] salt, int iter) throws Exception {
+      KeySpec spec = new PBEKeySpec(senha.toCharArray(), salt, iter, 256);
+      return SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(spec).getEncoded();
+   }
+
+   // POST /api/senha            {senhaAtual, novaSenha}  troca a propria senha
+   // POST /api/senha/reset      {id}                     admin: volta o medico ao primeiro acesso
+   static void handleSenha(HttpExchange var0) throws IOException {
+      if (!"POST".equals(var0.getRequestMethod())) {
+         send405(var0);
+         return;
+      }
+      Map<String, String> sessao = getSession(var0);
+      if (sessao == null) {
+         sendJson(var0, 401, "{\"error\":\"Nao autenticado\"}");
+         return;
+      }
+      Map<String, String> body = parseJsonObject(new String(var0.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+      try {
+         if (var0.getRequestURI().getPath().endsWith("/reset")) {
+            if (!"true".equals(sessao.get("isAdmin"))) {
+               sendJson(var0, 403, "{\"error\":\"Apenas o administrador pode resetar senhas\"}");
+               return;
+            }
+            String id = body.getOrDefault("id", "");
+            try (PreparedStatement ps = db.prepareStatement("DELETE FROM senhas WHERE usuario=?")) {
+               ps.setString(1, id);
+               ps.executeUpdate();
+            }
+            sessions.values().removeIf(s -> id.equals(s.get("usuario")));
+            sendJson(var0, 200, "{\"ok\":true}");
+            return;
+         }
+
+         String usuario = sessao.get("usuario");
+         String nova = body.getOrDefault("novaSenha", "").trim();
+         if (!"true".equals(sessao.get("trocarSenha"))) {
+            Map<String, String> medico = "admin".equals(usuario) ? null : medicos.stream().filter(m -> usuario.equals(m.get("id"))).findFirst().orElse(null);
+            if (conferirSenha(usuario, medico, body.getOrDefault("senhaAtual", "").trim()) == null) {
+               sendJson(var0, 400, "{\"error\":\"Senha atual incorreta\"}");
+               return;
+            }
+         }
+         if (nova.length() < SENHA_MIN) {
+            sendJson(var0, 400, "{\"error\":\"A nova senha precisa ter pelo menos " + SENHA_MIN + " caracteres\"}");
+            return;
+         }
+         String digitos = nova.replaceAll("[^0-9]", "");
+         boolean ehTelefone = digitos.length() >= 8 && medicos.stream().anyMatch(m -> {
+            String t = m.get("telefone") == null ? "" : m.get("telefone").replaceAll("[^0-9]", "");
+            return !t.isEmpty() && t.endsWith(digitos);
+         });
+         if (ehTelefone || ADMIN_SENHA_INICIAL.equals(nova)) {
+            sendJson(var0, 400, "{\"error\":\"Nao use numero de telefone como senha\"}");
+            return;
+         }
+         try (PreparedStatement ps = db.prepareStatement("INSERT OR REPLACE INTO senhas (usuario,hash,updated_at) VALUES (?,?,?)")) {
+            ps.setString(1, usuario);
+            ps.setString(2, gerarHash(nova));
+            ps.setString(3, now());
+            ps.executeUpdate();
+         }
+         String tokenAtual = getToken(var0);
+         sessions.entrySet().removeIf(e -> usuario.equals(e.getValue().get("usuario")) && !e.getKey().equals(tokenAtual));
+         sessao.put("trocarSenha", "false");
+         sendJson(var0, 200, "{\"ok\":true}");
+      } catch (Exception e) {
+         sendJson(var0, 500, "{\"error\":\"" + escapeJson(e.getMessage()) + "\"}");
+      }
+   }
+
+   // Exige login; quem ainda esta com a senha de primeiro acesso so pode criar a nova senha.
+   static HttpHandler autenticado(HttpHandler handler) {
+      return ex -> {
+         Map<String, String> sessao = getSession(ex);
+         if (sessao == null) {
+            sendJson(ex, 401, "{\"error\":\"Nao autenticado\"}");
+            return;
+         }
+         if ("true".equals(sessao.get("trocarSenha"))) {
+            sendJson(ex, 403, "{\"error\":\"Crie sua senha para continuar\",\"trocarSenha\":true}");
+            return;
+         }
+         handler.handle(ex);
+      };
    }
 
    static void handleLogout(HttpExchange var0) throws IOException {
@@ -527,6 +677,8 @@ public class EscalaServer {
                + var2
                + ",\"whatsappAtivo\":"
                + var5
+               + ",\"trocarSenha\":"
+               + "true".equals(var1.get("trocarSenha"))
                + ",\"sseClients\":"
                + sseClients.size()
                + "}"

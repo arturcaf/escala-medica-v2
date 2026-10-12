@@ -10,7 +10,7 @@
 body{font-family:system-ui,sans-serif;background:#f3f4f6;color:#1f2937;min-height:100vh}
 
 /* ── LOGIN ── */
-#login-screen{position:fixed;inset:0;background:linear-gradient(135deg,#1a56db,#1e429f);display:flex;align-items:center;justify-content:center;z-index:9999;padding:20px}
+#login-screen,#senha-screen{position:fixed;inset:0;background:linear-gradient(135deg,#1a56db,#1e429f);display:flex;align-items:center;justify-content:center;z-index:9999;padding:20px}
 .login-card{background:#fff;border-radius:16px;padding:32px;width:100%;max-width:380px;box-shadow:0 20px 60px rgba(0,0,0,.3)}
 .login-logo{text-align:center;margin-bottom:24px}
 .login-logo .icon{font-size:52px;display:block;margin-bottom:8px}
@@ -28,6 +28,7 @@ body{font-family:system-ui,sans-serif;background:#f3f4f6;color:#1f2937;min-heigh
 
 /* ── APP ── */
 #app{display:none}
+#senha-screen{display:none}
 header{background:linear-gradient(135deg,#1a56db,#1e429f);color:#fff;padding:0 16px;display:flex;align-items:center;justify-content:space-between;height:56px;position:sticky;top:0;z-index:100;box-shadow:0 2px 8px rgba(0,0,0,.2)}
 .hb{display:flex;align-items:center;gap:8px}
 .logo{width:32px;height:32px;background:rgba(255,255,255,.2);border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:16px}
@@ -250,15 +251,40 @@ select{padding:7px 10px;border:1px solid #d1d5db;border-radius:8px;font-size:12p
 <input autocomplete="username" id="inp-crm" inputmode="numeric" placeholder="Ex: 27140 ou 1" type="text"/>
 </div>
 <div class="login-field">
-<label>Senha (telefone sem formatacao)</label>
-<input autocomplete="current-password" id="inp-senha" inputmode="numeric" placeholder="Ex: 71991402300" type="password"/>
+<label>Senha</label>
+<input autocomplete="current-password" id="inp-senha" placeholder="Sua senha" type="password"/>
 </div>
 <button class="login-btn" onclick="doLogin()">🔒 Entrar</button>
 <div class="login-hint">
-<strong>Admin:</strong> CRM 27140 + senha especial<br/>
-<strong>Medicos:</strong> ID (1-18) + telefone sem formatacao<br/>
-      Ex: Alan Ortop → ID <strong>1</strong>, senha <strong>71988410202</strong>
+<strong>Primeiro acesso:</strong> use seu ID e seu telefone completo, so numeros.<br/>
+      Em seguida voce cria a sua propria senha.<br/>
+      Esqueceu a senha? Peca ao administrador para resetar.
 </div>
+</div>
+</div>
+<!-- ══ CRIAR / TROCAR SENHA ══ -->
+<div id="senha-screen">
+<div class="login-card">
+<div class="login-logo">
+<span class="icon">🔑</span>
+<h1 id="senha-titulo">Crie sua senha</h1>
+<p id="senha-sub">No primeiro acesso, troque o telefone por uma senha so sua.</p>
+</div>
+<div class="login-error" id="senha-error"></div>
+<div class="login-field" id="senha-atual-field">
+<label>Senha atual</label>
+<input autocomplete="current-password" id="inp-senha-atual" type="password"/>
+</div>
+<div class="login-field">
+<label>Nova senha (minimo 6 caracteres)</label>
+<input autocomplete="new-password" id="inp-senha-nova" type="password"/>
+</div>
+<div class="login-field">
+<label>Repita a nova senha</label>
+<input autocomplete="new-password" id="inp-senha-nova2" type="password"/>
+</div>
+<button class="login-btn" id="senha-btn" onclick="salvarSenha()">Salvar senha</button>
+<button class="login-btn" id="senha-cancelar" onclick="fecharSenha()" style="background:#e5e7eb;color:#374151">Cancelar</button>
 </div>
 </div>
 <!-- ══ APP ══ -->
@@ -271,6 +297,7 @@ select{padding:7px 10px;border:1px solid #d1d5db;border-radius:8px;font-size:12p
 <div class="hr">
 <span class="user-chip" id="user-chip"></span>
 <button id="notif-btn" onclick="toggleNotif()">🔔<span id="notif-badge"></span></button>
+<button class="logout-btn" onclick="abrirSenha(false)" title="Trocar senha">🔑</button>
 <button class="logout-btn" onclick="doLogout()">Sair</button>
 </div>
 </header>
@@ -557,7 +584,7 @@ function api(method,url,body){
 // ── SSE - TEMPO REAL ───────────────────────────────────────
 function connectSSE(){
   if(sseConn) sseConn.close();
-  sseConn=new EventSource('/api/events');
+  sseConn=new EventSource('/api/events?token='+encodeURIComponent(TOKEN||''));
   sseConn.onopen=function(){
     document.getElementById('realtime-bar').style.display='block';
     document.getElementById('realtime-txt').textContent='Conectado em tempo real';
@@ -570,7 +597,8 @@ function connectSSE(){
   };
   sseConn.onerror=function(){
     document.getElementById('realtime-txt').textContent='Reconectando...';
-    setTimeout(connectSSE,3000);
+    if(sseConn) sseConn.close();
+    if(TOKEN&&SESSION&&!SESSION.trocarSenha) setTimeout(connectSSE,3000);
   };
 }
 
@@ -631,7 +659,8 @@ function doLogin(){
     if(d.error){err.textContent=d.error;err.style.display='block';return;}
     TOKEN=d.token;SESSION=d;
     localStorage.setItem('escala_token',TOKEN);
-    initApp();
+    document.getElementById('inp-senha').value='';
+    if(d.trocarSenha) abrirSenha(true); else initApp();
   }).catch(function(){
     document.querySelector('.login-btn').textContent='Entrar';
     err.textContent='Erro de conexao. Verifique se o servidor esta rodando.';
@@ -641,6 +670,7 @@ function doLogin(){
 
 function doLogout(){
   if(sseConn) sseConn.close();
+  sseConn=null;
   api('POST','/api/logout').catch(function(){});
   TOKEN=null;SESSION=null;
   localStorage.removeItem('escala_token');
@@ -657,10 +687,52 @@ window.addEventListener('DOMContentLoaded',function(){
     TOKEN=saved;
     api('GET','/api/me').then(function(d){
       if(d.error){TOKEN=null;localStorage.removeItem('escala_token');return;}
-      SESSION=d;initApp();
+      SESSION=d;
+      if(d.trocarSenha) abrirSenha(true); else initApp();
     }).catch(function(){TOKEN=null;localStorage.removeItem('escala_token');});
   }
 });
+
+// ── SENHA ──────────────────────────────────────────────────
+function abrirSenha(obrigatorio){
+  document.getElementById('senha-error').style.display='none';
+  ['inp-senha-atual','inp-senha-nova','inp-senha-nova2'].forEach(function(id){document.getElementById(id).value='';});
+  document.getElementById('senha-titulo').textContent=obrigatorio?'Crie sua senha':'Trocar senha';
+  document.getElementById('senha-sub').textContent=obrigatorio?'No primeiro acesso, troque o telefone por uma senha so sua.':'Digite a senha atual e a nova senha.';
+  document.getElementById('senha-atual-field').style.display=obrigatorio?'none':'block';
+  document.getElementById('senha-cancelar').textContent=obrigatorio?'Sair':'Cancelar';
+  document.getElementById('senha-screen').dataset.obrigatorio=obrigatorio?'1':'';
+  document.getElementById('login-screen').style.display='none';
+  document.getElementById('senha-screen').style.display='flex';
+}
+function fecharSenha(){
+  document.getElementById('senha-screen').style.display='none';
+  if(document.getElementById('senha-screen').dataset.obrigatorio) doLogout();
+}
+function salvarSenha(){
+  var err=document.getElementById('senha-error');
+  var nova=document.getElementById('inp-senha-nova').value.trim();
+  var nova2=document.getElementById('inp-senha-nova2').value.trim();
+  var atual=document.getElementById('inp-senha-atual').value.trim();
+  err.style.display='none';
+  if(nova.length<6){err.textContent='A nova senha precisa ter pelo menos 6 caracteres.';err.style.display='block';return;}
+  if(nova!==nova2){err.textContent='As duas senhas nao conferem.';err.style.display='block';return;}
+  api('POST','/api/senha',{senhaAtual:atual,novaSenha:nova}).then(function(d){
+    if(d.error){err.textContent=d.error;err.style.display='block';return;}
+    var obrigatorio=document.getElementById('senha-screen').dataset.obrigatorio;
+    document.getElementById('senha-screen').style.display='none';
+    toast('Senha salva!','ok',3000);
+    SESSION.trocarSenha=false;
+    if(obrigatorio) initApp();
+  }).catch(function(){err.textContent='Erro de conexao.';err.style.display='block';});
+}
+function resetarSenha(id,nome){
+  if(!confirm('Resetar a senha de '+nome+'? No proximo acesso ele entra com o telefone e cria uma senha nova.')) return;
+  api('POST','/api/senha/reset',{id:id}).then(function(d){
+    if(d.error){toast(d.error,'er');return;}
+    toast('Senha de '+nome+' resetada.','ok');
+  });
+}
 
 function initApp(){
   document.getElementById('login-screen').style.display='none';
@@ -1153,6 +1225,7 @@ function buildAdminMedicosList(){
       '<div style="display:flex;align-items:center;gap:8px">'+
         '<span class="funcao-badge '+cls+'">'+funcao+'</span>'+
         '<button class="btn btn-sm" data-id="'+m[0]+'" onclick="editarMedico(this.dataset.id)" title="Editar">&#9999;&#65039;</button>'+
+        '<button class="btn btn-sm" data-id="'+m[0]+'" data-nome="'+m[1]+'" onclick="resetarSenha(this.dataset.id,this.dataset.nome)" title="Resetar senha">&#128273;</button>'+
         '<button class="btn btn-sm" style="color:#c81e1e;border-color:#c81e1e" data-id="'+m[0]+'" data-nome="'+m[1]+'" onclick="confirmarRemoverMedico(this.dataset.id,this.dataset.nome)" title="Remover">&#128465;&#65039;</button>'+
       '</div>'+
     '</div>';
