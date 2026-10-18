@@ -134,6 +134,11 @@ public class EscalaServer {
       var1.execute(
          "CREATE TABLE IF NOT EXISTS medicos_db (id INTEGER PRIMARY KEY, nome TEXT NOT NULL, telefone TEXT, funcao TEXT DEFAULT 'Plantonista', crm TEXT DEFAULT '', email TEXT DEFAULT '', ativo INTEGER DEFAULT 1, created_at TEXT, updated_at TEXT)"
       );
+      try {
+         // 1 quando a troca nasceu de uma oferta aberta a todos os plantonistas.
+         var1.execute("ALTER TABLE trocas ADD COLUMN oferta INTEGER DEFAULT 0");
+      } catch (Exception jaExiste) {
+      }
       var1.close();
       ResultSet var2 = db.createStatement().executeQuery("SELECT MAX(CAST(REPLACE(id,'TRK-','') AS INTEGER)) FROM trocas");
       if (var2.next() && var2.getObject(1) != null) {
@@ -1089,6 +1094,10 @@ public class EscalaServer {
             sendJson(var0, 200, objectsToJson(getTrocas(var22)));
          } else if ("POST".equals(var1)) {
             Map<String, String> var21 = parseJsonObject(new String(var0.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+            if ("true".equals(var21.get("aberta"))) {
+               criarOfertaAberta(var0, var21);
+               return;
+            }
             String var23 = (String)var21.get("solicitante");
             String var24 = (String)var21.get("plantaoId");
             String var25 = (String)var21.get("substituto");
@@ -1177,15 +1186,20 @@ public class EscalaServer {
             var31.put("dataDecisao", "");
             sendJson(var0, 200, objectToJson(var31));
          } else if ("PUT".equals(var1)) {
+            String[] var3 = var2.split("/");
+            String var4 = var3[var3.length - 1];
+            Map<String, String> var5 = parseJsonObject(new String(var0.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+            String var6 = (String)var5.get("acao");
+            if ("aceitar".equals(var6) || "cancelar".equals(var6)) {
+               processarOfertaAberta(var0, var4, var6);
+               return;
+            }
+
             if (!isAdmin(var0)) {
                sendJson(var0, 403, "{\"error\":\"Apenas o administrador pode processar trocas\"}");
                return;
             }
 
-            String[] var3 = var2.split("/");
-            String var4 = var3[var3.length - 1];
-            Map<String, String> var5 = parseJsonObject(new String(var0.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
-            String var6 = (String)var5.get("acao");
             String var7 = var5.getOrDefault("obsGestor", "");
             ResultSet var8 = db.prepareStatement("SELECT * FROM trocas WHERE id='" + var4 + "'").executeQuery();
             if (!var8.next()) {
@@ -1200,6 +1214,7 @@ public class EscalaServer {
                return;
             }
 
+            boolean daOferta = var8.getInt("oferta") == 1;
             String var9 = var8.getString("plantao_id");
             String var10 = var8.getString("substituto");
             String var11 = var8.getString("solicitante");
@@ -1241,6 +1256,13 @@ public class EscalaServer {
                      + var7
                      + "\n\nVoce permanece escalado neste plantao."
                );
+               if (daOferta) {
+                  notificarMedico(
+                     var10,
+                     "❌ TROCA RECUSADA - " + var4 + "\n\ud83d\udcc5 " + var12 + " (" + var14 + ")\n⏰ " + var13
+                        + "\n\nO plantao que voce aceitou de " + var11 + " nao foi aprovado.\nMotivo: " + var7
+                  );
+               }
             } else {
                String var16 = var7.isEmpty() ? "Aprovado pelo Dr. Artur Cesar." : var7;
                PreparedStatement var17 = db.prepareStatement("UPDATE trocas SET status='APROVADA',obs_gestor=?,data_decisao=? WHERE id=?");
@@ -1319,6 +1341,166 @@ public class EscalaServer {
          sendJson(var0, 500, "{\"error\":\"" + escapeJson(var20.getMessage()) + "\"}");
          var20.printStackTrace();
       }
+   }
+
+   // POST /api/trocas {aberta:"true", plantaoId, motivo, obs}
+   // Oferece o plantao a todos os plantonistas. O primeiro que aceitar vira o substituto
+   // e a troca segue para aprovacao do administrador, como uma troca comum.
+   static synchronized void criarOfertaAberta(HttpExchange ex, Map<String, String> body) throws Exception {
+      Map<String, String> sessao = getSession(ex);
+      String plantaoId = body.getOrDefault("plantaoId", "");
+      String motivo = body.getOrDefault("motivo", "").trim();
+      String obs = body.getOrDefault("obs", "");
+      if (plantaoId.isEmpty() || motivo.isEmpty()) {
+         sendJson(ex, 400, "{\"error\":\"Campos obrigatorios faltando\"}");
+         return;
+      }
+
+      String[] plantao = escala.stream().filter(r -> r[0].equals(plantaoId)).findFirst().orElse(null);
+      if (plantao == null) {
+         sendJson(ex, 404, "{\"error\":\"Plantao nao encontrado\"}");
+         return;
+      }
+
+      String solicitante = plantao[5];
+      if (!isAdmin(ex) && !solicitante.equals(sessao.get("nome"))) {
+         sendJson(ex, 403, "{\"error\":\"Voce so pode oferecer os seus proprios plantoes\"}");
+         return;
+      }
+
+      if (!"AGENDADO".equals(plantao[6]) || plantao[1].compareTo(LocalDate.now().toString()) < 0) {
+         sendJson(ex, 400, "{\"error\":\"Este plantao nao pode mais ser oferecido\"}");
+         return;
+      }
+
+      try (PreparedStatement ps = db.prepareStatement("SELECT id FROM trocas WHERE plantao_id=? AND status IN ('ABERTA','PENDENTE')")) {
+         ps.setString(1, plantaoId);
+         try (ResultSet rs = ps.executeQuery()) {
+            if (rs.next()) {
+               sendJson(ex, 400, "{\"error\":\"Ja existe uma troca ou oferta em andamento para este plantao (" + rs.getString("id") + ")\"}");
+               return;
+            }
+         }
+      }
+
+      String id = "TRK-" + String.format("%04d", trocaCounter.getAndIncrement());
+      try (PreparedStatement ps = db.prepareStatement(
+         "INSERT INTO trocas (id,plantao_id,data_plantao,dia_plantao,turno,plantonista_original,solicitante,substituto,motivo,obs,status,data_solicitacao,obs_gestor,data_decisao,oferta) VALUES (?,?,?,?,?,?,?,'',?,?,'ABERTA',?,'','',1)"
+      )) {
+         ps.setString(1, id);
+         ps.setString(2, plantaoId);
+         ps.setString(3, plantao[1]);
+         ps.setString(4, plantao[2]);
+         ps.setString(5, plantao[3]);
+         ps.setString(6, plantao[5]);
+         ps.setString(7, solicitante);
+         ps.setString(8, motivo);
+         ps.setString(9, obs);
+         ps.setString(10, now());
+         ps.executeUpdate();
+      }
+
+      addNotificacaoAndBroadcast("OFERTA", "Plantao oferecido", solicitante + " oferece o plantao de " + plantao[1] + " (" + plantao[3] + ") a todos");
+      broadcast(
+         "oferta_nova",
+         "{\"id\":\"" + id + "\",\"solicitante\":\"" + escapeJson(solicitante) + "\",\"dataPlantao\":\"" + plantao[1] + "\"}"
+      );
+      String msg = "📢 PLANTAO OFERECIDO A TODOS\nID: " + id
+         + "\n📅 " + plantao[1] + " (" + plantao[2] + ")\n⏰ " + plantao[3]
+         + "\n👤 Oferecido por: " + solicitante
+         + "\n💬 Motivo: " + motivo
+         + "\n\nO primeiro que aceitar no app fica com o plantao (sujeito a aprovacao do Dr. Artur Cesar).";
+      for (Map<String, String> m : new ArrayList<>(medicos)) {
+         if (!m.get("nome").equals(solicitante)) {
+            notificarMedico(m.get("nome"), msg);
+         }
+      }
+
+      List<Map<String, String>> criada = getTrocas(null).stream().filter(t -> t.get("id").equals(id)).collect(Collectors.toList());
+      sendJson(ex, 200, criada.isEmpty() ? "{}" : objectToJson(criada.get(0)));
+   }
+
+   // PUT /api/trocas/{id} {acao:"aceitar"|"cancelar"} sobre uma oferta aberta.
+   static synchronized void processarOfertaAberta(HttpExchange ex, String id, String acao) throws Exception {
+      String nome = getSession(ex).get("nome");
+      String solicitante;
+      String dataPlantao;
+      String diaPlantao;
+      String turno;
+      try (PreparedStatement ps = db.prepareStatement("SELECT * FROM trocas WHERE id=?")) {
+         ps.setString(1, id);
+         try (ResultSet rs = ps.executeQuery()) {
+            if (!rs.next()) {
+               sendJson(ex, 404, "{\"error\":\"Oferta nao encontrada\"}");
+               return;
+            }
+            if (!"ABERTA".equals(rs.getString("status"))) {
+               sendJson(ex, 409, "{\"error\":\"Esta oferta nao esta mais disponivel\"}");
+               return;
+            }
+            solicitante = rs.getString("solicitante");
+            dataPlantao = rs.getString("data_plantao");
+            diaPlantao = rs.getString("dia_plantao");
+            turno = rs.getString("turno");
+         }
+      }
+
+      if ("cancelar".equals(acao)) {
+         if (!nome.equals(solicitante) && !isAdmin(ex)) {
+            sendJson(ex, 403, "{\"error\":\"Apenas quem ofereceu pode cancelar a oferta\"}");
+            return;
+         }
+         try (PreparedStatement ps = db.prepareStatement("UPDATE trocas SET status='CANCELADA',data_decisao=? WHERE id=? AND status='ABERTA'")) {
+            ps.setString(1, now());
+            ps.setString(2, id);
+            ps.executeUpdate();
+         }
+         addNotificacaoAndBroadcast("OFERTA_CANCELADA", "Oferta cancelada", "A oferta " + id + " do plantao de " + dataPlantao + " foi cancelada.");
+         broadcast("oferta_cancelada", "{\"id\":\"" + id + "\"}");
+      } else {
+         if (nome.equals(solicitante)) {
+            sendJson(ex, 400, "{\"error\":\"Voce nao pode aceitar a sua propria oferta\"}");
+            return;
+         }
+         // A escala usa o nome exato do cadastro, entao so aceita quem esta nele.
+         if (medicos.stream().noneMatch(m -> m.get("nome").equals(nome))) {
+            sendJson(ex, 403, "{\"error\":\"Seu usuario nao esta no cadastro de medicos\"}");
+            return;
+         }
+         int alterados;
+         try (PreparedStatement ps = db.prepareStatement("UPDATE trocas SET status='PENDENTE',substituto=? WHERE id=? AND status='ABERTA'")) {
+            ps.setString(1, nome);
+            ps.setString(2, id);
+            alterados = ps.executeUpdate();
+         }
+         if (alterados == 0) {
+            sendJson(ex, 409, "{\"error\":\"Outro plantonista aceitou esta oferta primeiro\"}");
+            return;
+         }
+         addNotificacaoAndBroadcast("TROCA", "Oferta aceita", nome + " aceitou o plantao de " + dataPlantao + " oferecido por " + solicitante + ". Aguarda aprovacao.");
+         broadcast(
+            "oferta_aceita",
+            "{\"id\":\"" + id + "\",\"solicitante\":\"" + escapeJson(solicitante) + "\",\"substituto\":\"" + escapeJson(nome) + "\",\"dataPlantao\":\"" + dataPlantao + "\"}"
+         );
+         notificarMedico(
+            "Artur Cesar",
+            "🔄 OFERTA ACEITA - APROVAR TROCA\nID: " + id
+               + "\n📅 " + dataPlantao + " (" + diaPlantao + ")\n⏰ " + turno
+               + "\n👤 Ofereceu: " + solicitante
+               + "\n👤 Aceitou: " + nome
+               + "\n\nAcesse o app para aprovar ou recusar."
+         );
+         if (!"Artur Cesar".equals(solicitante)) {
+            notificarMedico(
+               solicitante,
+               "🤝 OFERTA ACEITA - " + id + "\n📅 " + dataPlantao + " (" + diaPlantao + ")\n⏰ " + turno
+                  + "\n\n" + nome + " aceitou o seu plantao. Aguarda aprovacao do Dr. Artur Cesar.\nAte la, voce continua escalado."
+            );
+         }
+      }
+
+      List<Map<String, String>> atual = getTrocas(null).stream().filter(t -> t.get("id").equals(id)).collect(Collectors.toList());
+      sendJson(ex, 200, atual.isEmpty() ? "{}" : objectToJson(atual.get(0)));
    }
 
    static void handleCheckin(HttpExchange var0) throws IOException {
@@ -1609,6 +1791,7 @@ public class EscalaServer {
          var5.put("dataSolicitacao", var3.getString("data_solicitacao"));
          var5.put("obsGestor", var3.getString("obs_gestor"));
          var5.put("dataDecisao", var3.getString("data_decisao"));
+         var5.put("oferta", var3.getInt("oferta") == 1 ? "true" : "false");
          var4.add(var5);
       }
 
