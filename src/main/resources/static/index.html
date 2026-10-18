@@ -386,15 +386,20 @@ select{padding:7px 10px;border:1px solid #d1d5db;border-radius:8px;font-size:12p
 <div class="ct">➕ Nova Solicitacao de Troca</div>
 <div class="fg"><label class="fl">Medico Solicitante *</label><select class="fc" id="ss" onchange="loadPl()"><option value="">Selecione...</option></select></div>
 <div class="fg"><label class="fl">Plantao a Trocar *</label><select class="fc" id="sp"><option value="">Selecione o medico primeiro...</option></select></div>
-<div class="fg"><label class="fl">Candidato Substituto *</label><select class="fc" id="su"><option value="">Selecione...</option></select></div>
+<label style="display:flex;align-items:center;gap:8px;margin-bottom:12px;font-size:13px;cursor:pointer"><input type="checkbox" id="sab" onchange="toggleAberta()"> 📢 Oferecer a todos os plantonistas (o primeiro que aceitar fica com o plantão)</label>
+<div class="fg" id="su-box"><label class="fl">Candidato Substituto *</label><select class="fc" id="su"><option value="">Selecione...</option></select></div>
 <div class="fg"><label class="fl">Motivo *</label><textarea class="fc" id="sm" placeholder="Descreva o motivo..." rows="3"></textarea></div>
 <div class="fg"><label class="fl">Observacoes (opcional)</label><textarea class="fc" id="so" rows="2"></textarea></div>
 <button class="btn btn-p" onclick="enviarTroca()" style="width:100%">Enviar Solicitacao</button>
 </div>
 <div class="card">
+<div class="ct">📢 Plantões Oferecidos a Todos</div>
+<div id="olist"></div>
+</div>
+<div class="card">
 <div class="ct" style="justify-content:space-between">
 <span>📁 Gerenciar Trocas</span>
-<select id="fts" onchange="loadTrocas()" style="font-size:11px;padding:3px 7px"><option value="">Todas</option><option value="PENDENTE">Pendentes</option><option value="APROVADA">Aprovadas</option><option value="RECUSADA">Recusadas</option></select>
+<select id="fts" onchange="loadTrocas()" style="font-size:11px;padding:3px 7px"><option value="">Todas</option><option value="ABERTA">Ofertas abertas</option><option value="PENDENTE">Pendentes</option><option value="APROVADA">Aprovadas</option><option value="RECUSADA">Recusadas</option><option value="CANCELADA">Ofertas canceladas</option></select>
 </div>
 <div id="tlist"></div>
 </div>
@@ -624,6 +629,11 @@ function handleSSEEvent(d){
       loadTrocas();
       toast('Troca recusada pelo administrador.','er',4000);
       break;
+    case 'oferta_nova':
+    case 'oferta_aceita':
+    case 'oferta_cancelada':
+      loadTrocas();buildPainel();buildCal();filt();
+      break;
     case 'troca_nova':
       loadTrocas();
       if(SESSION&&SESSION.isAdmin) toast('Nova solicitacao de troca recebida!','wn',4000);
@@ -758,6 +768,8 @@ function initApp(){
     buildPainel();buildCal();buildFilters();buildTrocaForm();renderEq(M);upBadge();
     if(SESSION.isAdmin) buildAdminTab();
     initCheckinTab();
+    var ofs=TROCAS.filter(function(t){return t.status==='ABERTA'&&t.solicitante!==SESSION.nome;}).length;
+    if(ofs>0) setTimeout(function(){toast(ofs+' plantao(oes) oferecido(s) a todos. Veja na aba Trocas.','wn',6000);},1500);
     connectSSE();
     if((SESSION.notificacoesPendentes||0)>0){
       toast('Voce tem '+(SESSION.notificacoesPendentes)+' notificacao(oes) nova(s)!','wn',5000);
@@ -805,7 +817,7 @@ function showTab(id){
 }
 
 function upBadge(){
-  var p=TROCAS.filter(function(t){return t.status==='PENDENTE';}).length;
+  var p=TROCAS.filter(function(t){return t.status==='PENDENTE'||(t.status==='ABERTA'&&SESSION&&t.solicitante!==SESSION.nome);}).length;
   var b=document.getElementById('tbg');
   if(p>0){b.textContent=p;b.style.display='inline';}else{b.style.display='none';}
 }
@@ -827,10 +839,10 @@ function buildPainel(){
     var r=prox[i],d=db(r[1]),cls='',dc='',lb='';
     if(itd(r[1])){cls='hj';dc='hj';lb='HOJE';}else if(itm(r[1])){cls='am';dc='am';lb='AMANHA';}else{lb='em '+d+' dias';}
     if(r[6]==='A DEFINIR')cls='id';
-    var tr=TROCAS.find(function(t){return t.plantaoId===r[0]&&t.status==='PENDENTE';});
+    var tr=trAtiva(r[0]);
     ph+='<div class="pc '+cls+'"><div class="pd '+dc+'">'+fd(r[1])+' - '+r[2]+' - '+lb+'</div>'+
       '<div class="pn">'+r[5]+'</div><div class="pi">'+r[3]+'</div>'+
-      (tr?'<span class="bx bv">Troca Pendente</span>':'<span class="bx '+(r[6]==='AGENDADO'?'bg':'by')+'">'+r[6]+'</span>')+
+      (tr?trBadge(tr):'<span class="bx '+(r[6]==='AGENDADO'?'bg':'by')+'">'+r[6]+'</span>')+
       '</div>';
   }
   document.getElementById('prox').innerHTML=ph||'<div style="color:#9ca3af;font-size:12px">Sem plantoes futuros</div>';
@@ -893,7 +905,7 @@ function buildCal(){
   for(var i=0;i<DP.length;i++)h+='<div class="ch">'+DP[i]+'</div>';
   var fd2=new Date(CY,CM,1).getDay(),dim=new Date(CY,CM+1,0).getDate(),dip=new Date(CY,CM,0).getDate();
   var em={};for(var i=0;i<E.length;i++){var d=new Date(E[i][1]+'T00:00:00');if(d.getFullYear()===CY&&d.getMonth()===CM)em[d.getDate()]=E[i];}
-  var tm={};TROCAS.filter(function(t){return t.status==='PENDENTE';}).forEach(function(t){var r=E.find(function(x){return x[0]===t.plantaoId;});if(r){var d=new Date(r[1]+'T00:00:00');if(d.getFullYear()===CY&&d.getMonth()===CM)tm[d.getDate()]=true;}});
+  var tm={};TROCAS.filter(function(t){return t.status==='PENDENTE'||t.status==='ABERTA';}).forEach(function(t){var r=E.find(function(x){return x[0]===t.plantaoId;});if(r){var d=new Date(r[1]+'T00:00:00');if(d.getFullYear()===CY&&d.getMonth()===CM)tm[d.getDate()]=true;}});
   for(var i=fd2-1;i>=0;i--)h+='<div class="cl om"><div class="dn">'+(dip-i)+'</div></div>';
   for(var d=1;d<=dim;d++){
     var iso=CY+'-'+String(CM+1).padStart(2,'0')+'-'+String(d).padStart(2,'0');
@@ -910,7 +922,7 @@ function calNav(dir){CM+=dir;if(CM>11){CM=0;CY++;}if(CM<0){CM=11;CY--;}buildCal(
 function calToday(){CY=TOD.getFullYear();CM=TOD.getMonth();buildCal();closeDet();}
 function showDet(iso){
   var r=E.find(function(x){return x[1]===iso;});
-  var tr=r?TROCAS.find(function(t){return t.plantaoId===r[0]&&t.status==='PENDENTE';}):null;
+  var tr=r?trAtiva(r[0]):null;
   var p=document.getElementById('dp');p.classList.add('show');
   document.getElementById('dtt').textContent=r?r[5]:'Sem plantao';
   document.getElementById('dtts').textContent=fdl(iso);
@@ -918,8 +930,8 @@ function showDet(iso){
     '<div class="di"><div class="dil">Data</div><div class="div2">'+fd(r[1])+'</div></div>'+
     '<div class="di"><div class="dil">Dia</div><div class="div2">'+r[2]+'</div></div>'+
     '<div class="di"><div class="dil">Turno</div><div class="div2">'+r[3]+'</div></div>'+
-    '<div class="di"><div class="dil">Status</div><div class="div2">'+(tr?'<span class="bx bv">Troca Pendente</span>':'<span class="bx '+(r[6]==='AGENDADO'?'bg':'by')+'">'+r[6]+'</span>')+'</div></div>'+
-    (tr?'<div class="di"><div class="dil">Substituto</div><div class="div2">'+tr.substituto+'</div></div>':'')
+    '<div class="di"><div class="dil">Status</div><div class="div2">'+(tr?trBadge(tr):'<span class="bx '+(r[6]==='AGENDADO'?'bg':'by')+'">'+r[6]+'</span>')+'</div></div>'+
+    (tr&&tr.substituto?'<div class="di"><div class="dil">Substituto</div><div class="div2">'+tr.substituto+'</div></div>':'')
     :'<div class="di"><div class="dil">Obs</div><div class="div2">Nenhum plantao cadastrado.</div></div>';
 }
 function closeDet(){document.getElementById('dp').classList.remove('show');}
@@ -941,8 +953,8 @@ function filt(){
   var q=document.getElementById('si2').value.toLowerCase(),st=document.getElementById('fst').value;
   var me=document.getElementById('fme').value,md=document.getElementById('fmd').value;
   FD=E.filter(function(r){
-    var tr=TROCAS.find(function(t){return t.plantaoId===r[0]&&t.status==='PENDENTE';});
-    var se=tr?'TROCA PENDENTE':r[6];
+    var tr=trAtiva(r[0]);
+    var se=tr?(tr.status==='ABERTA'?'OFERECIDO':'TROCA PENDENTE'):r[6];
     var tx=(r.join(' ')+' '+se).toLowerCase();
     return(!q||tx.indexOf(q)>=0)&&(!st||se===st)&&(!me||r[1].startsWith(me))&&(!md||r[5]===md);
   });CP=1;renderTbl();
@@ -951,9 +963,9 @@ function renderTbl(){
   var st=(CP-1)*PS,pg=FD.slice(st,st+PS),h='';
   for(var i=0;i<pg.length;i++){
     var r=pg[i];
-    var tr=TROCAS.find(function(t){return t.plantaoId===r[0]&&t.status==='PENDENTE';});
+    var tr=trAtiva(r[0]);
     var hc=itd(r[1])?'hr':'',vc=tr?'vr':'';
-    var sb=tr?'<span class="bx bv">Troca Pendente</span>':'<span class="bx '+(r[6]==='AGENDADO'?'bg':'by')+'">'+r[6]+'</span>';
+    var sb=tr?trBadge(tr):'<span class="bx '+(r[6]==='AGENDADO'?'bg':'by')+'">'+r[6]+'</span>';
     var rid=r[0];
     var ab=r[6]==='AGENDADO'&&!tr?'<button class="btn btn-sm" data-id="'+rid+'" onclick="qTroca(this.dataset.id)">Solicitar Troca</button>':tr?'<button class="btn btn-sm" onclick="showTab(\'trocas\')" style="color:#7c3aed">Ver Troca</button>':'--';
     h+='<tr class="'+hc+' '+vc+'"><td><strong>'+fd(r[1])+'</strong></td><td>'+r[2]+'</td><td>'+r[3]+'</td>'+
@@ -983,7 +995,7 @@ function buildTrocaForm(){
 function loadPl(){
   var n=document.getElementById('ss').value,sp=document.getElementById('sp');
   sp.innerHTML='<option value="">Selecione o plantao...</option>';if(!n)return;
-  var pl=E.filter(function(r){if(r[5]!==n||r[1]<TD||r[6]!=='AGENDADO')return false;return !TROCAS.find(function(t){return t.plantaoId===r[0]&&t.status==='PENDENTE';});});
+  var pl=E.filter(function(r){if(r[5]!==n||r[1]<TD||r[6]!=='AGENDADO')return false;return !trAtiva(r[0]);});
   if(!pl.length){sp.innerHTML='<option value="">Nenhum plantao disponivel</option>';return;}
   pl.forEach(function(r){var o=document.createElement('option');o.value=r[0];o.textContent=fd(r[1])+' - '+r[2]+' - '+r[3];sp.appendChild(o);});
 }
@@ -992,6 +1004,12 @@ function enviarTroca(){
   var sol=document.getElementById('ss').value,pid=document.getElementById('sp').value;
   var sub=document.getElementById('su').value,mot=document.getElementById('sm').value.trim();
   var obs=document.getElementById('so').value.trim();
+  if(document.getElementById('sab').checked){
+    if(!sol||!pid||!mot){toast('Preencha todos os campos obrigatorios.','wn');return;}
+    api('POST','/api/trocas',{aberta:'true',plantaoId:pid,motivo:mot,obs:obs})
+      .then(function(t){if(t.error){toast(t.error,'er');return;}toast('Plantao oferecido a todos ('+t.id+').','ok');document.getElementById('sp').value='';document.getElementById('sm').value='';document.getElementById('so').value='';document.getElementById('sab').checked=false;toggleAberta();loadTrocas();}).catch(function(){toast('Erro ao enviar.','er');});
+    return;
+  }
   if(!sol||!pid||!sub||!mot){toast('Preencha todos os campos obrigatorios.','wn');return;}
   if(sol===sub){toast('Solicitante e substituto nao podem ser o mesmo.','wn');return;}
   api('POST','/api/trocas',{solicitante:sol,plantaoId:pid,substituto:sub,motivo:mot,obs:obs})
@@ -1000,26 +1018,60 @@ function enviarTroca(){
 function loadTrocas(){
   var f=document.getElementById('fts').value;
   api('GET','/api/trocas'+(f?'?status='+f:'')).then(function(d){TROCAS=d;upBadge();renderTR();});
+  api('GET','/api/trocas?status=ABERTA').then(renderOfertas);
+}
+function trAtiva(pid){return TROCAS.find(function(t){return t.plantaoId===pid&&(t.status==='PENDENTE'||t.status==='ABERTA');});}
+function trBadge(tr){return tr.status==='ABERTA'?'<span class="bx bb">Oferecido a todos</span>':'<span class="bx bv">Troca Pendente</span>';}
+function toggleAberta(){
+  var ab=document.getElementById('sab').checked;
+  document.getElementById('su-box').style.display=ab?'none':'';
+  if(ab)document.getElementById('su').value='';
+}
+function ofertaBotoes(t){
+  var me=SESSION?SESSION.nome:'',h='';
+  if(t.solicitante!==me)h+='<button class="btn btn-s btn-sm" data-id="'+t.id+'" onclick="aceitarOferta(this.dataset.id)">Aceitar plantão</button>';
+  if(t.solicitante===me||(SESSION&&SESSION.isAdmin))h+='<button class="btn btn-sm" data-id="'+t.id+'" onclick="cancelarOferta(this.dataset.id)">Cancelar oferta</button>';
+  return h;
+}
+function renderOfertas(d){
+  var el=document.getElementById('olist');
+  if(!d||!d.length){el.innerHTML='<div style="text-align:center;padding:16px;color:#9ca3af;font-size:12px">Nenhum plantão oferecido no momento</div>';return;}
+  el.innerHTML=d.map(function(t){
+    return '<div class="xc pe">'+
+      '<div class="xh"><div><div class="xi">'+t.id+'</div><div style="font-size:12px;font-weight:700">'+fd(t.dataPlantao)+' - '+t.diaPlantao+' - '+t.turno+'</div></div><span class="bx bb">Aberta</span></div>'+
+      '<div style="font-size:12px;color:#374151">Oferecido por <b>'+t.solicitante+'</b></div>'+
+      '<div class="xm">"'+t.motivo+'"'+(t.obs?' - '+t.obs:'')+'</div>'+
+      '<div class="xa">'+ofertaBotoes(t)+'</div></div>';
+  }).join('');
+}
+function aceitarOferta(id){
+  if(!confirm('Aceitar este plantão? Ele passa para o seu nome depois da aprovação do administrador.'))return;
+  api('PUT','/api/trocas/'+id,{acao:'aceitar'}).then(function(d){if(d.error){toast(d.error,'er');loadTrocas();return;}toast('Voce aceitou o plantao. Aguardando aprovacao.','ok',5000);loadTrocas();buildPainel();}).catch(function(){toast('Erro ao aceitar.','er');});
+}
+function cancelarOferta(id){
+  if(!confirm('Cancelar esta oferta?'))return;
+  api('PUT','/api/trocas/'+id,{acao:'cancelar'}).then(function(d){if(d.error){toast(d.error,'er');return;}toast('Oferta cancelada.','ok');loadTrocas();buildPainel();}).catch(function(){toast('Erro ao cancelar.','er');});
 }
 function renderTR(){
   var el=document.getElementById('tlist');
   if(!TROCAS.length){el.innerHTML='<div style="text-align:center;padding:30px;color:#9ca3af;font-size:12px">Nenhuma troca encontrada</div>';return;}
   var h='';
   TROCAS.forEach(function(t){
-    var sc=t.status==='PENDENTE'?'pe':t.status==='APROVADA'?'ap':'re';
-    var sb=t.status==='PENDENTE'?'<span class="bx by">Pendente</span>':t.status==='APROVADA'?'<span class="bx bg">Aprovada</span>':'<span class="bx br">Recusada</span>';
+    var sc=t.status==='PENDENTE'||t.status==='ABERTA'?'pe':t.status==='APROVADA'?'ap':'re';
+    var sb=t.status==='ABERTA'?'<span class="bx bb">Oferta aberta</span>':t.status==='CANCELADA'?'<span class="bx br">Oferta cancelada</span>':t.status==='PENDENTE'?'<span class="bx by">Pendente</span>':t.status==='APROVADA'?'<span class="bx bg">Aprovada</span>':'<span class="bx br">Recusada</span>';
     var tid=t.id;
     var isAdm=SESSION&&SESSION.isAdmin;
     var ac2=t.status==='PENDENTE'&&isAdm?
       '<button class="btn btn-s btn-sm" data-id="'+tid+'" onclick="openAp(this.dataset.id)">Aprovar</button>'+
       '<button class="btn btn-d btn-sm" data-id="'+tid+'" onclick="openRe(this.dataset.id)">Recusar</button>':
       '<span style="font-size:10px;color:#9ca3af">'+t.dataDecisao+'</span>';
+    if(t.status==='ABERTA')ac2=ofertaBotoes(t);
     h+='<div class="xc '+sc+'">'+
       '<div class="xh"><div><div class="xi">'+t.id+'</div><div style="font-size:10px;color:#6b7280">'+t.dataSolicitacao+'</div></div>'+sb+'</div>'+
       '<div class="xb"><div class="xf"><div class="xfl">Data</div><div class="xfv">'+fd(t.dataPlantao)+' - '+t.diaPlantao+'</div></div>'+
       '<div class="xf"><div class="xfl">Turno</div><div class="xfv">'+t.turno+'</div></div>'+
       '<div class="xf"><div class="xfl">Solicitante</div><div class="xfv">'+t.solicitante+'</div></div>'+
-      '<div class="xf"><div class="xfl">Substituto</div><div class="xfv">'+t.substituto+'</div></div></div>'+
+      '<div class="xf"><div class="xfl">Substituto</div><div class="xfv">'+(t.substituto||'Aberto a todos')+(t.oferta==='true'&&t.substituto?' <span style="font-size:10px;color:#6b7280">(aceitou oferta)</span>':'')+'</div></div></div>'+
       '<div class="xm">"'+t.motivo+'"'+(t.obs?' - '+t.obs:'')+'</div>'+
       (t.obsGestor?'<div class="xm" style="background:'+(t.status==='APROVADA'?'#def7ec':'#fde8e8')+'">Gestor: "'+t.obsGestor+'"</div>':'')+
       '<div class="xa">'+ac2+'</div></div>';
